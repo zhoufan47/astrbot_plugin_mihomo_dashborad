@@ -138,10 +138,29 @@ class MihomoClient:
     "1.0.0",
 )
 class MihomoDashboardPlugin(Star):
+    # 选择会话上下文的过期时间（秒），超过该时间 /选择 指令将失效
+    _SELECTION_TTL = 5 * 60
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.client = self._build_client()
+        # 保存每个 session 最近一次 /代理测速 的结果：
+        #   key   = event.session_id
+        #   value = {"group": str, "nodes": {编号(int): 节点名(str)}, "expire_at": float}
+        self._pending_selections: dict[str, dict[str, Any]] = {}
+
+    def _cleanup_expired_selections(self):
+        """清理已过期的测速上下文，避免字典无限增长。"""
+        import time
+
+        now = time.time()
+        expired = [
+            k for k, v in self._pending_selections.items()
+            if v.get("expire_at", 0) < now
+        ]
+        for k in expired:
+            self._pending_selections.pop(k, None)
 
     def _build_client(self) -> MihomoClient:
         host = str(self.config.get("mihomo_host", "127.0.0.1") or "127.0.0.1")
@@ -228,7 +247,8 @@ class MihomoDashboardPlugin(Star):
     @filter.command("代理测速")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_group(self, event: AstrMessageEvent, group: str):
-        """测试指定代理组下所有节点的延迟。"""
+        """测试指定代理组下所有节点的延迟。返回的节点前会加上编号，
+        用户可通过 /选择 <编号> 或 /代理选择 <编号> 进行快速切换。"""
         try:
             info = await self.client.get_proxy(group)
         except Exception as e:
@@ -256,9 +276,27 @@ class MihomoDashboardPlugin(Star):
         # 按延迟升序排序，超时放末尾
         results.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0))
 
-        lines = [f"🔍 代理组「{group}」测速结果（从快到慢）："]
-        for name, delay in results:
-            lines.append(f"  - {name}: {self._format_delay(delay)}")
+        # 给节点重新编号（从 1 开始，按延迟从低到高）
+        indexed: list[tuple[int, str, Optional[int]]] = [
+            (idx + 1, name, delay) for idx, (name, delay) in enumerate(results)
+        ]
+
+        # 保存会话上下文，供 /选择 指令使用（按 session_id 隔离，多人互不干扰）
+        import time
+
+        self._cleanup_expired_selections()
+        self._pending_selections[event.session_id] = {
+            "group": group,
+            "nodes": {idx: name for idx, name, _ in indexed},
+            "expire_at": time.time() + self._SELECTION_TTL,
+        }
+
+        lines = [
+            f"🔍 代理组「{group}」测速结果（从快到慢）：",
+            "💡 回复 /选择 <编号> 可快速切换，例如：/选择 1",
+        ]
+        for idx, name, delay in indexed:
+            lines.append(f"  {idx:>2}. {name}: {self._format_delay(delay)}")
         yield event.plain_result("\n".join(lines))
 
     async def _delay_one(self, name: str) -> tuple[str, Optional[int]]:
@@ -309,6 +347,52 @@ class MihomoDashboardPlugin(Star):
             yield event.plain_result(
                 f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
             )
+
+    @filter.command("选择")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def select_by_index(self, event: AstrMessageEvent, index: int):
+        """通过 /代理测速 输出中的编号切换代理组节点。
+
+        该指令依赖当前会话最近一次 /代理测速 的结果，过期时间为 5 分钟。
+        """
+        import time
+
+        self._cleanup_expired_selections()
+        pending = self._pending_selections.get(event.session_id)
+        if not pending:
+            yield event.plain_result(
+                "⚠️ 当前会话没有可用的测速结果，请先使用 /代理测速 <组名>。"
+            )
+            return
+
+        group: str = pending["group"]
+        nodes: dict[int, str] = pending["nodes"]
+
+        if index not in nodes:
+            yield event.plain_result(
+                f"❌ 编号 {index} 不在范围内（1 - {len(nodes)}）。请使用 /代理测速 <组名> 重新测速。"
+            )
+            return
+
+        proxy = nodes[index]
+        ok = await self.client.select_proxy(group, proxy)
+        if ok:
+            yield event.plain_result(
+                f"✅ 已将代理组「{group}」切换为「{proxy}」。"
+            )
+            # 切换成功后清理会话状态，避免误用
+            self._pending_selections.pop(event.session_id, None)
+        else:
+            yield event.plain_result(
+                f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
+            )
+
+    @filter.command("代理选择")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def select_by_index_alias(self, event: AstrMessageEvent, index: int):
+        """/选择 指令的别名。"""
+        async for r in self.select_by_index(event, index):
+            yield r
 
     @filter.command("代理状态")
     @filter.permission_type(filter.PermissionType.ADMIN)

@@ -2,5 +2,5 @@ name: astrbot_plugin_mihomo_dashborad # 插件唯一识别名，以 astrbot_plug
 display_name: Mihomo 代理管理 # 用于展示的名字（需要版本 >= v4.5.0）
 desc: 通过 mihomo 的 external-controller RESTful API，实现对代理组、节点延迟、节点切换的管理。
 version: v1.0.0 # 插件版本号
-author: zhoufan # 作者
-repo: https://github.com/Soulter/astrbot_plugin_mihomo_dashborad # 插件的仓库地址
+author: 棒棒糖 # 作者
+repo: https://github.com/zhoufan47/astrbot_plugin_mihomo_dashborad # 插件的仓库地址
