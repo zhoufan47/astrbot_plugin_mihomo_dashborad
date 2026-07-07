@@ -273,7 +273,6 @@ class MihomoDashboardPlugin(Star):
         )
 
     @filter.command("代理测试")
-    @filter.alias("代理测速")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_group(self, event: AstrMessageEvent, group: str):
         """测试指定代理组下所有节点的延迟，并给出数字序号供切换。"""
