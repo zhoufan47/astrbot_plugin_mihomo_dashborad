@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -138,29 +140,15 @@ class MihomoClient:
     "1.0.0",
 )
 class MihomoDashboardPlugin(Star):
-    # 选择会话上下文的过期时间（秒），超过该时间 /选择 指令将失效
-    _SELECTION_TTL = 5 * 60
-
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.client = self._build_client()
-        # 保存每个 session 最近一次 /代理测速 的结果：
-        #   key   = event.session_id
-        #   value = {"group": str, "nodes": {编号(int): 节点名(str)}, "expire_at": float}
-        self._pending_selections: dict[str, dict[str, Any]] = {}
-
-    def _cleanup_expired_selections(self):
-        """清理已过期的测速上下文，避免字典无限增长。"""
-        import time
-
-        now = time.time()
-        expired = [
-            k for k, v in self._pending_selections.items()
-            if v.get("expire_at", 0) < now
-        ]
-        for k in expired:
-            self._pending_selections.pop(k, None)
+        # 最近一次 /代理测试 的结果缓存：
+        # { group_name: { "nodes": [(index, node_name), ...], "timestamp": float } }
+        # 节点按延迟升序排列，过期时间为 5 分钟
+        self._last_test_results: dict[str, dict[str, Any]] = {}
+        self._test_result_ttl = 300  # 5 分钟
 
     def _build_client(self) -> MihomoClient:
         host = str(self.config.get("mihomo_host", "127.0.0.1") or "127.0.0.1")
@@ -228,6 +216,46 @@ class MihomoDashboardPlugin(Star):
             lines.append(f"{idx}. {name}  [类型: {gtype}, 节点数: {all_count}, 当前: {now}]")
         return "\n".join(lines)
 
+    # ---------- 测速结果缓存工具 ----------
+
+    def _save_test_result(
+        self, group: str, numbered_nodes: list[tuple[int, str]]
+    ) -> None:
+        """保存某代理组最近一次测试的 (序号, 节点名) 映射。"""
+        self._last_test_results[group] = {
+            "nodes": list(numbered_nodes),
+            "timestamp": time.time(),
+        }
+
+    def _resolve_index_to_node(self, group: str, index: int) -> Optional[str]:
+        """根据最近一次的测试结果，将数字序号解析为实际的节点名。
+        若缓存过期或未命中则返回 None。"""
+        entry = self._last_test_results.get(group)
+        if not entry:
+            return None
+        # 检查是否过期
+        if time.time() - float(entry.get("timestamp", 0)) > self._test_result_ttl:
+            self._last_test_results.pop(group, None)
+            return None
+        for idx, name in entry.get("nodes", []):
+            if idx == index:
+                return name
+        return None
+
+    @staticmethod
+    def _parse_index(value: str) -> Optional[int]:
+        """解析纯数字字符串为正整数；非纯数字返回 None。"""
+        if value is None:
+            return None
+        s = str(value).strip()
+        if not s or not re.fullmatch(r"\d+", s):
+            return None
+        try:
+            n = int(s)
+        except ValueError:
+            return None
+        return n if n > 0 else None
+
     # ---------- 指令 ----------
 
     @filter.command("代理查询")
@@ -244,11 +272,11 @@ class MihomoDashboardPlugin(Star):
             "📋 当前 mihomo 代理组列表：\n" + self._build_group_lines(groups)
         )
 
-    @filter.command("代理测速")
+    @filter.command("代理测试")
+    @filter.alias("代理测速")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_group(self, event: AstrMessageEvent, group: str):
-        """测试指定代理组下所有节点的延迟。返回的节点前会加上编号，
-        用户可引用此条消息并回复编号（如 1）进行快速切换。"""
+        """测试指定代理组下所有节点的延迟，并给出数字序号供切换。"""
         try:
             info = await self.client.get_proxy(group)
         except Exception as e:
@@ -276,27 +304,18 @@ class MihomoDashboardPlugin(Star):
         # 按延迟升序排序，超时放末尾
         results.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0))
 
-        # 给节点重新编号（从 1 开始，按延迟从低到高）
-        indexed: list[tuple[int, str, Optional[int]]] = [
-            (idx + 1, name, delay) for idx, (name, delay) in enumerate(results)
-        ]
-
-        # 保存会话上下文，供引用切换逻辑使用（按 session_id 隔离，多人互不干扰）
-        import time
-
-        self._cleanup_expired_selections()
-        self._pending_selections[event.session_id] = {
-            "group": group,
-            "nodes": {idx: name for idx, name, _ in indexed},
-            "expire_at": time.time() + self._SELECTION_TTL,
-        }
+        # 分配数字编号并保存到缓存（5 分钟内可用 /代理切换 <组> <序号>）
+        numbered_nodes: list[tuple[int, str]] = []
+        for idx, (name, _delay) in enumerate(results, 1):
+            numbered_nodes.append((idx, name))
+        self._save_test_result(group, numbered_nodes)
 
         lines = [
             f"🔍 代理组「{group}」测速结果（从快到慢）：",
-            "💡 长按/引用此条消息并回复编号（如 1）即可切换到对应节点",
+            "使用方式：/代理切换 <代理组> <数字序号>",
         ]
-        for idx, name, delay in indexed:
-            lines.append(f"  {idx:>2}. {name}: {self._format_delay(delay)}")
+        for idx, (name, delay) in enumerate(results, 1):
+            lines.append(f"  {idx}. {name}: {self._format_delay(delay)}")
         yield event.plain_result("\n".join(lines))
 
     async def _delay_one(self, name: str) -> tuple[str, Optional[int]]:
@@ -308,7 +327,23 @@ class MihomoDashboardPlugin(Star):
     @filter.command("代理切换")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def switch_proxy(self, event: AstrMessageEvent, group: str, proxy: str):
-        """切换指定代理组下的选中节点。"""
+        """切换指定代理组下的选中节点。
+        第二个参数支持两种形式：
+          - 纯数字序号：会根据最近一次 /代理测试 缓存解析为节点名（5 分钟内有效）。
+          - 节点名称：与历史行为一致，按节点名查找。
+        """
+        # 若第二个参数是数字，则尝试从最近测试结果解析为节点名
+        index = self._parse_index(proxy)
+        if index is not None:
+            resolved = self._resolve_index_to_node(group, index)
+            if resolved is None:
+                yield event.plain_result(
+                    f"❌ 未找到序号「{index}」对应的节点。\n"
+                    f"请先执行 /代理测试 {group}（结果仅在 5 分钟内有效）。"
+                )
+                return
+            proxy = resolved
+
         try:
             info = await self.client.get_proxy(group)
         except Exception as e:
@@ -340,92 +375,11 @@ class MihomoDashboardPlugin(Star):
 
         ok = await self.client.select_proxy(group, proxy)
         if ok:
-            yield event.plain_result(
-                f"✅ 已将代理组「{group}」切换为「{proxy}」。"
-            )
-        else:
-            yield event.plain_result(
-                f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
-            )
-
-    @filter.on_message()
-    async def handle_quoted_selection(self, event: AstrMessageEvent):
-        """监听用户消息：当用户引用（回复）某条消息 + 发送纯数字时，
-        根据当前会话最近一次 /代理测速 的结果切换节点。
-
-        用法：长按/引用 bot 之前发的那条测速结果消息，然后回复编号（如 1）。
-        """
-        import time
-
-        # 解析消息链，提取是否包含引用组件与纯文本
-        has_reply = False
-        plain_text = ""
-        try:
-            chain = event.get_messages() or []
-        except Exception:
-            chain = []
-        for comp in chain:
-            # 通过类型名判断引用组件，兼容不同平台（Reply / Reference / Quote）
-            cname = type(comp).__name__
-            if cname in ("Reply", "Reference", "Quote"):
-                has_reply = True
-            elif cname == "Plain" and hasattr(comp, "text"):
-                plain_text += str(comp.text)
-        # 尝试从 astrbot.api.message_components 导入 Reply 类以兜底
-        if not has_reply:
-            try:
-                from astrbot.api.message_components import Reply as _Reply
-                if any(isinstance(c, _Reply) for c in chain):
-                    has_reply = True
-            except Exception:
-                pass
-
-        # 必须满足：用户引用了某条消息 + 内容是纯数字
-        if not has_reply:
-            return
-        text = plain_text.strip()
-        if not text.isdigit():
-            return
-        try:
-            index = int(text)
-        except ValueError:
-            return
-
-        # 只处理管理员（如果框架提供了 is_admin）
-        try:
-            is_admin_fn = getattr(event, "is_admin", None)
-            if is_admin_fn is not None and callable(is_admin_fn):
-                if not is_admin_fn():
-                    return
-        except Exception:
-            pass
-
-        # 取当前会话最近一次的测速结果
-        self._cleanup_expired_selections()
-        pending = self._pending_selections.get(event.session_id)
-        if not pending:
-            yield event.plain_result(
-                "⚠️ 当前会话没有可用的测速结果，请先使用 /代理测速 <组名>。"
-            )
-            return
-
-        group: str = pending["group"]
-        nodes: dict[int, str] = pending["nodes"]
-
-        if index not in nodes:
-            yield event.plain_result(
-                f"❌ 编号 {index} 不在范围内（1 - {len(nodes)}）。请重新执行 /代理测速 <组名>。"
-            )
-            return
-
-        proxy = nodes[index]
-        ok = await self.client.select_proxy(group, proxy)
-        if ok:
-            yield event.plain_result(
-                f"✅ 已将代理组「{group}」切换为「{proxy}」。"
-            )
-            # 切换成功后清理会话状态，避免误用
-            self._pending_selections.pop(event.session_id, None)
+            if index is not None:
+                msg = f"✅ 已将代理组「{group}」按序号 {index} 切换为「{proxy}」。"
+            else:
+                msg = f"✅ 已将代理组「{group}」切换为「{proxy}」。"
+            yield event.plain_result(msg)
         else:
             yield event.plain_result(
                 f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
