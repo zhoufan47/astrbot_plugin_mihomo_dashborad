@@ -248,7 +248,7 @@ class MihomoDashboardPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_group(self, event: AstrMessageEvent, group: str):
         """测试指定代理组下所有节点的延迟。返回的节点前会加上编号，
-        用户可通过 /选择 <编号> 或 /代理选择 <编号> 进行快速切换。"""
+        用户可引用此条消息并回复编号（如 1）进行快速切换。"""
         try:
             info = await self.client.get_proxy(group)
         except Exception as e:
@@ -281,7 +281,7 @@ class MihomoDashboardPlugin(Star):
             (idx + 1, name, delay) for idx, (name, delay) in enumerate(results)
         ]
 
-        # 保存会话上下文，供 /选择 指令使用（按 session_id 隔离，多人互不干扰）
+        # 保存会话上下文，供引用切换逻辑使用（按 session_id 隔离，多人互不干扰）
         import time
 
         self._cleanup_expired_selections()
@@ -293,7 +293,7 @@ class MihomoDashboardPlugin(Star):
 
         lines = [
             f"🔍 代理组「{group}」测速结果（从快到慢）：",
-            "💡 回复 /选择 <编号> 可快速切换，例如：/选择 1",
+            "💡 长按/引用此条消息并回复编号（如 1）即可切换到对应节点",
         ]
         for idx, name, delay in indexed:
             lines.append(f"  {idx:>2}. {name}: {self._format_delay(delay)}")
@@ -348,15 +348,59 @@ class MihomoDashboardPlugin(Star):
                 f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
             )
 
-    @filter.command("选择")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def select_by_index(self, event: AstrMessageEvent, index: int):
-        """通过 /代理测速 输出中的编号切换代理组节点。
+    @filter.on_message()
+    async def handle_quoted_selection(self, event: AstrMessageEvent):
+        """监听用户消息：当用户引用（回复）某条消息 + 发送纯数字时，
+        根据当前会话最近一次 /代理测速 的结果切换节点。
 
-        该指令依赖当前会话最近一次 /代理测速 的结果，过期时间为 5 分钟。
+        用法：长按/引用 bot 之前发的那条测速结果消息，然后回复编号（如 1）。
         """
         import time
 
+        # 解析消息链，提取是否包含引用组件与纯文本
+        has_reply = False
+        plain_text = ""
+        try:
+            chain = event.get_messages() or []
+        except Exception:
+            chain = []
+        for comp in chain:
+            # 通过类型名判断引用组件，兼容不同平台（Reply / Reference / Quote）
+            cname = type(comp).__name__
+            if cname in ("Reply", "Reference", "Quote"):
+                has_reply = True
+            elif cname == "Plain" and hasattr(comp, "text"):
+                plain_text += str(comp.text)
+        # 尝试从 astrbot.api.message_components 导入 Reply 类以兜底
+        if not has_reply:
+            try:
+                from astrbot.api.message_components import Reply as _Reply
+                if any(isinstance(c, _Reply) for c in chain):
+                    has_reply = True
+            except Exception:
+                pass
+
+        # 必须满足：用户引用了某条消息 + 内容是纯数字
+        if not has_reply:
+            return
+        text = plain_text.strip()
+        if not text.isdigit():
+            return
+        try:
+            index = int(text)
+        except ValueError:
+            return
+
+        # 只处理管理员（如果框架提供了 is_admin）
+        try:
+            is_admin_fn = getattr(event, "is_admin", None)
+            if is_admin_fn is not None and callable(is_admin_fn):
+                if not is_admin_fn():
+                    return
+        except Exception:
+            pass
+
+        # 取当前会话最近一次的测速结果
         self._cleanup_expired_selections()
         pending = self._pending_selections.get(event.session_id)
         if not pending:
@@ -370,7 +414,7 @@ class MihomoDashboardPlugin(Star):
 
         if index not in nodes:
             yield event.plain_result(
-                f"❌ 编号 {index} 不在范围内（1 - {len(nodes)}）。请使用 /代理测速 <组名> 重新测速。"
+                f"❌ 编号 {index} 不在范围内（1 - {len(nodes)}）。请重新执行 /代理测速 <组名>。"
             )
             return
 
@@ -386,13 +430,6 @@ class MihomoDashboardPlugin(Star):
             yield event.plain_result(
                 f"❌ 切换失败，请确认 mihomo 配置是否允许手动切换该组。"
             )
-
-    @filter.command("代理选择")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def select_by_index_alias(self, event: AstrMessageEvent, index: int):
-        """/选择 指令的别名。"""
-        async for r in self.select_by_index(event, index):
-            yield r
 
     @filter.command("代理状态")
     @filter.permission_type(filter.PermissionType.ADMIN)
