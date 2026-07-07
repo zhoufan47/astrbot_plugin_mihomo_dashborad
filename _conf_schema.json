@@ -1,0 +1,32 @@
+{
+    "mihomo_host": {
+        "description": "mihomo 服务器 IP",
+        "type": "string",
+        "hint": "mihomo 所在服务器的 IP 地址，例如 127.0.0.1 或 192.168.1.10",
+        "default": "127.0.0.1"
+    },
+    "mihomo_port": {
+        "description": "mihomo 管理端口",
+        "type": "int",
+        "hint": "mihomo 配置文件中 external-controller 的端口，例如 9090",
+        "default": 9090
+    },
+    "mihomo_secret": {
+        "description": "mihomo 管理密码",
+        "type": "string",
+        "hint": "mihomo 配置文件中 external-controller 的 secret 字段（API 访问密钥），留空表示无密码",
+        "default": ""
+    },
+    "delay_timeout": {
+        "description": "测速超时时间（毫秒）",
+        "type": "int",
+        "hint": "调用 /delay 接口时的 timeout 参数（单位毫秒），默认 5000",
+        "default": 5000
+    },
+    "delay_url": {
+        "description": "测速目标 URL",
+        "type": "string",
+        "hint": "调用 /delay 接口时使用的测试 URL，默认为 http://www.gstatic.com/generate_204",
+        "default": "http://www.gstatic.com/generate_204"
+    }
+}
